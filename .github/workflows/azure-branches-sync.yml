@@ -2,6 +2,13 @@ name: Sync GitHub branches to Azure DevOps
 
 on:
   workflow_call:
+    inputs:
+      azure_org:
+        required: true
+        type: string
+      azure_project:
+        required: true
+        type: string
     secrets:
       AZURE_PAT:
         required: true
