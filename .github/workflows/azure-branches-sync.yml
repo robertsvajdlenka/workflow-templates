@@ -70,27 +70,27 @@ jobs:
         run: |
           BRANCH_NAME="${{ steps.prep.outputs.branch_name }}"
           EVENT="${{ steps.prep.outputs.event }}"
-
+      
           # For delete event, skip parent branch detection
           if [[ "$EVENT" == "delete" ]]; then
             echo "::notice::Delete event – skipping parent branch detection."
             echo "parent_branch=" >> $GITHUB_OUTPUT
             exit 0
           fi
-
+      
           PARENT_BRANCH=""
-
+      
           echo "---- DEBUG ----"
           echo "BRANCH_NAME: $BRANCH_NAME"
           echo "EVENT: $EVENT"
-
+      
           # If the branch is 'main', we do not need to detect the parent
           if [[ "$BRANCH_NAME" == "main" ]]; then
             echo "::notice::Branch is 'main', skipping parent branch detection."
             echo "parent_branch=" >> $GITHUB_OUTPUT
             exit 0
           fi
-
+      
           # 1. Try to detect the parent branch using .base_ref (reliable for Pull Request events)
           if jq -e '.base_ref' < $GITHUB_EVENT_PATH > /dev/null; then
             PARENT_BRANCH=$(jq -r '.base_ref' < $GITHUB_EVENT_PATH | sed 's#refs/heads/##')
@@ -98,7 +98,7 @@ jobs:
               echo "::notice::Detected parent branch from .base_ref: $PARENT_BRANCH"
             fi
           fi
-
+      
           # 2. Fallback: detect parent branch using Azure mirror tags
           if [ -z "$PARENT_BRANCH" ]; then
             echo "Attempting to detect parent branch using Azure mirror tags..."
@@ -106,7 +106,7 @@ jobs:
             # Get current branch SHA
             CURRENT_SHA=$(git rev-parse HEAD)
             echo "Current branch SHA: $CURRENT_SHA"
-
+      
             # Find all branches that have Azure mirror tags
             TAGGED_BRANCHES=()
             echo "Looking for branches with Azure mirror tags..."
@@ -125,9 +125,9 @@ jobs:
                 fi
               fi
             done
-
+      
             echo "Branches with Azure mirror tags: ${TAGGED_BRANCHES[@]}"
-
+      
             if [[ ${#TAGGED_BRANCHES[@]} -eq 0 ]]; then
               echo "::warning::No branches found with Azure mirror tags."
               echo "This might be the first branch being synced, or tags are missing."
@@ -142,59 +142,80 @@ jobs:
               fi
             else
               # Strategy: Find tagged branches that could be parents
-              POTENTIAL_PARENTS=()
+              SAME_SHA_PARENTS=()
+              ANCESTOR_PARENTS=()
               
               for candidate in "${TAGGED_BRANCHES[@]}"; do
                 CANDIDATE_SHA=$(git rev-parse "origin/$candidate")
                 
-                # Check if this branch could be a parent (has same or different SHA)
+                # Check if this branch could be a parent
                 if [[ "$CANDIDATE_SHA" == "$CURRENT_SHA" ]]; then
-                  # Same SHA - could be a sibling created from same point
-                  POTENTIAL_PARENTS+=("$candidate")
+                  # Same SHA - this is the most likely parent (branch was created from this point)
+                  SAME_SHA_PARENTS+=("$candidate")
                   echo "Potential parent (same SHA): $candidate"
                 else
                   # Different SHA - check if it's an ancestor
                   if git merge-base --is-ancestor "origin/$candidate" HEAD 2>/dev/null; then
-                    POTENTIAL_PARENTS+=("$candidate")
+                    ANCESTOR_PARENTS+=("$candidate")
                     echo "Potential parent (ancestor): $candidate"
                   fi
                 fi
               done
-
-              # If no ancestors found, include all tagged branches with same SHA
-              if [[ ${#POTENTIAL_PARENTS[@]} -eq 0 ]]; then
-                for candidate in "${TAGGED_BRANCHES[@]}"; do
-                  CANDIDATE_SHA=$(git rev-parse "origin/$candidate")
-                  if [[ "$CANDIDATE_SHA" == "$CURRENT_SHA" ]]; then
-                    POTENTIAL_PARENTS+=("$candidate")
-                    echo "Fallback potential parent (same SHA): $candidate"
-                  fi
-                done
-              fi
-
-              # Select the best parent from potential parents
-              if [[ ${#POTENTIAL_PARENTS[@]} -gt 0 ]]; then
-                # Prefer 'main' if it's in the list
-                for candidate in "${POTENTIAL_PARENTS[@]}"; do
+      
+              # PRIORITY 1: Prefer branches with same SHA (exact match)
+              if [[ ${#SAME_SHA_PARENTS[@]} -gt 0 ]]; then
+                # If main is among same SHA branches, prefer it
+                for candidate in "${SAME_SHA_PARENTS[@]}"; do
                   if [[ "$candidate" == "main" ]]; then
                     PARENT_BRANCH="main"
-                    echo "::notice::Selected 'main' as parent branch (preferred from tagged branches)"
+                    echo "::notice::Selected 'main' as parent branch (same SHA, preferred)"
                     break
                   fi
                 done
-
-                # If main is not in the list, use the first available
+                
+                # If main is not among same SHA branches, use the first one
                 if [[ -z "$PARENT_BRANCH" ]]; then
-                  PARENT_BRANCH="${POTENTIAL_PARENTS[0]}"
-                  echo "::notice::Selected first available tagged branch as parent: $PARENT_BRANCH"
+                  PARENT_BRANCH="${SAME_SHA_PARENTS[0]}"
+                  echo "::notice::Selected parent branch from same SHA match: $PARENT_BRANCH"
+                fi
+                
+              # PRIORITY 2: Fall back to ancestor branches
+              elif [[ ${#ANCESTOR_PARENTS[@]} -gt 0 ]]; then
+                # Prefer 'main' if it's in the ancestor list
+                for candidate in "${ANCESTOR_PARENTS[@]}"; do
+                  if [[ "$candidate" == "main" ]]; then
+                    PARENT_BRANCH="main"
+                    echo "::notice::Selected 'main' as parent branch (ancestor, preferred)"
+                    break
+                  fi
+                done
+      
+                # If main is not in the ancestor list, use the first available
+                if [[ -z "$PARENT_BRANCH" ]]; then
+                  PARENT_BRANCH="${ANCESTOR_PARENTS[0]}"
+                  echo "::notice::Selected first available ancestor as parent: $PARENT_BRANCH"
                 fi
               else
-                echo "::error::No suitable parent found among tagged branches."
-                exit 1
+                # PRIORITY 3: If no ancestors found, include all tagged branches with same SHA as fallback
+                for candidate in "${TAGGED_BRANCHES[@]}"; do
+                  CANDIDATE_SHA=$(git rev-parse "origin/$candidate")
+                  if [[ "$CANDIDATE_SHA" == "$CURRENT_SHA" ]]; then
+                    SAME_SHA_PARENTS+=("$candidate")
+                    echo "Fallback potential parent (same SHA): $candidate"
+                  fi
+                done
+                
+                if [[ ${#SAME_SHA_PARENTS[@]} -gt 0 ]]; then
+                  PARENT_BRANCH="${SAME_SHA_PARENTS[0]}"
+                  echo "::notice::Selected fallback parent from same SHA: $PARENT_BRANCH"
+                else
+                  echo "::error::No suitable parent found among tagged branches."
+                  exit 1
+                fi
               fi
             fi
           fi
-
+      
           # Log the final result or fail if parent could not be detected
           if [[ -z "$PARENT_BRANCH" ]]; then
             echo "::error::Parent branch could not be detected for branch '$BRANCH_NAME' (not main). Aborting."
@@ -202,7 +223,7 @@ jobs:
           else
             echo "::notice::Final detected PARENT_BRANCH: $PARENT_BRANCH"
           fi
-
+      
           echo "parent_branch=${PARENT_BRANCH}" >> $GITHUB_OUTPUT
 
       - name: Sync branch to Azure DevOps
