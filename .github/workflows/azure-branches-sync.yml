@@ -16,7 +16,6 @@ on:
 jobs:
   azure_branch_sync:
     runs-on: ubuntu-latest
-
     env:
       AZURE_ORG: ${{ inputs.azure_org }}
       AZURE_PROJECT: ${{ inputs.azure_project }}
@@ -26,11 +25,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1
-          fetch-tags: false
-          
-      - name: Fetch all remote branches
-        run: git fetch --all --prune
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Fetch all remote branches and tags
+        run: |
+          git fetch --all --prune
+          git fetch --tags
 
       - name: Install jq
         run: sudo apt-get update && sudo apt-get install -y jq
@@ -64,13 +65,12 @@ jobs:
           echo "event=$EVENT" >> $GITHUB_OUTPUT
           echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
 
-      - name: Detect parent branch (if applicable)
+      - name: Detect parent branch using Azure mirror tags
         id: parent
         run: |
           BRANCH_NAME="${{ steps.prep.outputs.branch_name }}"
           EVENT="${{ steps.prep.outputs.event }}"
 
-          
           # For delete event, skip parent branch detection
           if [[ "$EVENT" == "delete" ]]; then
             echo "::notice::Delete event – skipping parent branch detection."
@@ -83,32 +83,6 @@ jobs:
           echo "---- DEBUG ----"
           echo "BRANCH_NAME: $BRANCH_NAME"
           echo "EVENT: $EVENT"
-
-          # Determine BEFORE_SHA based on event type
-          BEFORE_SHA=""
-
-          if [[ "$EVENT" == "push" ]]; then
-            BEFORE_SHA=$(jq -r '.before // empty' < $GITHUB_EVENT_PATH)
-            echo "Detected PUSH event. BEFORE_SHA from event: $BEFORE_SHA"
-          elif [[ "$EVENT" == "create" ]]; then
-            BEFORE_SHA=$(git rev-parse HEAD)
-            echo "Detected CREATE event. BEFORE_SHA from git HEAD: $BEFORE_SHA"
-          else
-            # Fallback: first try from event, then from HEAD as backup
-            BEFORE_SHA=$(jq -r '.before // empty' < $GITHUB_EVENT_PATH)
-            if [[ -z "$BEFORE_SHA" || "$BEFORE_SHA" == "null" ]]; then
-              BEFORE_SHA=$(git rev-parse HEAD)
-              echo "Unknown event type – fallback, BEFORE_SHA from git HEAD: $BEFORE_SHA"
-            else
-              echo "Unknown event type – fallback, BEFORE_SHA from event: $BEFORE_SHA"
-            fi
-          fi
-
-          echo "BEFORE_SHA: $BEFORE_SHA"
-          echo "Remote branches and their HEAD SHAs:"
-          git fetch --all --prune
-          git for-each-ref --format='%(refname:short) %(objectname:short)' refs/remotes/origin/
-          echo "---------------"
 
           # If the branch is 'main', we do not need to detect the parent
           if [[ "$BRANCH_NAME" == "main" ]]; then
@@ -125,30 +99,98 @@ jobs:
             fi
           fi
 
-          # 2. Fallback: detect parent branch using 'before' SHA (already set properly above)
+          # 2. Fallback: detect parent branch using Azure mirror tags
           if [ -z "$PARENT_BRANCH" ]; then
-            if [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
-              MATCHED_BRANCHES=()
-              for branch in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/); do
-                BRANCH_SHA=$(git rev-parse "$branch")
-                if [ "$BRANCH_SHA" = "$BEFORE_SHA" ]; then
-                  CANDIDATE="${branch#origin/}"
-                  MATCHED_BRANCHES+=("$CANDIDATE")
+            echo "Attempting to detect parent branch using Azure mirror tags..."
+            
+            # Get current branch SHA
+            CURRENT_SHA=$(git rev-parse HEAD)
+            echo "Current branch SHA: $CURRENT_SHA"
+
+            # Find all branches that have Azure mirror tags
+            TAGGED_BRANCHES=()
+            echo "Looking for branches with Azure mirror tags..."
+            
+            # Get all remote branches except the current one
+            for branch in $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/); do
+              CANDIDATE="${branch#origin/}"
+              # Skip the current branch
+              if [[ "$CANDIDATE" != "$BRANCH_NAME" ]]; then
+                # Check if this branch has an Azure mirror tag
+                TAG_NAME="azure-mirror/${CANDIDATE}"
+                if git tag -l "$TAG_NAME" | grep -q "^$TAG_NAME$"; then
+                  TAGGED_BRANCHES+=("$CANDIDATE")
+                  CANDIDATE_SHA=$(git rev-parse "origin/$CANDIDATE")
+                  echo "Found branch with Azure mirror tag: $CANDIDATE (SHA: $CANDIDATE_SHA)"
+                fi
+              fi
+            done
+
+            echo "Branches with Azure mirror tags: ${TAGGED_BRANCHES[@]}"
+
+            if [[ ${#TAGGED_BRANCHES[@]} -eq 0 ]]; then
+              echo "::warning::No branches found with Azure mirror tags."
+              echo "This might be the first branch being synced, or tags are missing."
+              
+              # Fallback to 'main' if it exists (for the very first sync)
+              if git rev-parse --verify "origin/main" >/dev/null 2>&1; then
+                PARENT_BRANCH="main"
+                echo "::notice::Using 'main' as fallback parent (no tagged branches found)"
+              else
+                echo "::error::No tagged branches found and 'main' doesn't exist. Cannot determine parent."
+                exit 1
+              fi
+            else
+              # Strategy: Find tagged branches that could be parents
+              POTENTIAL_PARENTS=()
+              
+              for candidate in "${TAGGED_BRANCHES[@]}"; do
+                CANDIDATE_SHA=$(git rev-parse "origin/$candidate")
+                
+                # Check if this branch could be a parent (has same or different SHA)
+                if [[ "$CANDIDATE_SHA" == "$CURRENT_SHA" ]]; then
+                  # Same SHA - could be a sibling created from same point
+                  POTENTIAL_PARENTS+=("$candidate")
+                  echo "Potential parent (same SHA): $candidate"
+                else
+                  # Different SHA - check if it's an ancestor
+                  if git merge-base --is-ancestor "origin/$candidate" HEAD 2>/dev/null; then
+                    POTENTIAL_PARENTS+=("$candidate")
+                    echo "Potential parent (ancestor): $candidate"
+                  fi
                 fi
               done
 
-              if [ ${#MATCHED_BRANCHES[@]} -gt 0 ]; then
-                for candidate in "${MATCHED_BRANCHES[@]}"; do
+              # If no ancestors found, include all tagged branches with same SHA
+              if [[ ${#POTENTIAL_PARENTS[@]} -eq 0 ]]; then
+                for candidate in "${TAGGED_BRANCHES[@]}"; do
+                  CANDIDATE_SHA=$(git rev-parse "origin/$candidate")
+                  if [[ "$CANDIDATE_SHA" == "$CURRENT_SHA" ]]; then
+                    POTENTIAL_PARENTS+=("$candidate")
+                    echo "Fallback potential parent (same SHA): $candidate"
+                  fi
+                done
+              fi
+
+              # Select the best parent from potential parents
+              if [[ ${#POTENTIAL_PARENTS[@]} -gt 0 ]]; then
+                # Prefer 'main' if it's in the list
+                for candidate in "${POTENTIAL_PARENTS[@]}"; do
                   if [[ "$candidate" == "main" ]]; then
                     PARENT_BRANCH="main"
-                    echo "::notice::Detected parent branch from SHA match (prefer main): $PARENT_BRANCH"
+                    echo "::notice::Selected 'main' as parent branch (preferred from tagged branches)"
                     break
                   fi
                 done
-                if [ -z "$PARENT_BRANCH" ]; then
-                  PARENT_BRANCH="${MATCHED_BRANCHES[0]}"
-                  echo "::notice::Detected parent branch from SHA match: $PARENT_BRANCH"
+
+                # If main is not in the list, use the first available
+                if [[ -z "$PARENT_BRANCH" ]]; then
+                  PARENT_BRANCH="${POTENTIAL_PARENTS[0]}"
+                  echo "::notice::Selected first available tagged branch as parent: $PARENT_BRANCH"
                 fi
+              else
+                echo "::error::No suitable parent found among tagged branches."
+                exit 1
               fi
             fi
           fi
@@ -164,9 +206,10 @@ jobs:
           echo "parent_branch=${PARENT_BRANCH}" >> $GITHUB_OUTPUT
 
       - name: Sync branch to Azure DevOps
+        id: azure_sync
         run: |
           set -e
-          
+
           if [[ "${GITHUB_REPOSITORY_OWNER}" == "DodoSystem" ]]; then
             AZURE_REPO="Customers"
           else
@@ -178,54 +221,67 @@ jobs:
           EVENT="${{ steps.prep.outputs.event }}"
           AZURE_BRANCH="${REPO_NAME}/${BRANCH_NAME}"
           PARENT_BRANCH="${{ steps.parent.outputs.parent_branch }}"
+
           REFS_API="https://dev.azure.com/$AZURE_ORG/$AZURE_PROJECT/_apis/git/repositories/$AZURE_REPO/refs?api-version=7.1"
 
           echo "====================== BRANCH SYNC CONTEXT ======================"
-          echo "Azure Repo name     : $AZURE_REPO"
-          echo "Github Repo name    : $REPO_NAME"
-          echo "Github Branch name  : $BRANCH_NAME"
-          echo "Event type          : $EVENT"
-          echo "Azure branch        : $AZURE_BRANCH"
-          echo "Detected parent     : $PARENT_BRANCH"
+          echo "Azure Repo name : $AZURE_REPO"
+          echo "Github Repo name : $REPO_NAME"
+          echo "Github Branch name : $BRANCH_NAME"
+          echo "Event type : $EVENT"
+          echo "Azure branch : $AZURE_BRANCH"
+          echo "Detected parent : $PARENT_BRANCH"
           echo "==============================================================="
 
-          if [[ "$EVENT" == "create" ]]; then
+          # Set output for tagging step
+          echo "sync_success=false" >> $GITHUB_OUTPUT
 
+          if [[ "$EVENT" == "create" ]]; then
             # 1. Check if branch already exists
             EXISTS=$(curl -s -u ":$AZURE_PAT" "$REFS_API&filter=heads/$AZURE_BRANCH" \
               | jq -r '.value | map(select(.name=="refs/heads/'"$AZURE_BRANCH"'")) | length')
+
             if [[ "$EXISTS" -gt "0" ]]; then
               echo "::error::Branch ${AZURE_BRANCH} already exists in Azure DevOps. Branch creation aborted."
               exit 1
             fi
 
-            # 2. Main branch creation: must originate from Azure 'main'            
+            # 2. Main branch creation: must originate from Azure 'main'
             if [[ "$BRANCH_NAME" == "main" ]]; then
               echo "::notice::[INFO] Creating the first customer main branch, e.g. 'customer-x/main'."
+
               MAIN_SHA=$(curl -s -u ":$AZURE_PAT" "$REFS_API&filter=heads/main" | jq -r '.value[] | select(.name=="refs/heads/main") | .objectId')
+
               if [[ -z "$MAIN_SHA" || "$MAIN_SHA" == "null" ]]; then
                 echo "::error::'main' branch does not exist in Azure DevOps repo. Cannot create initial branch (e.g. 'customer-x/main')."
                 exit 1
               fi
 
               echo "::notice::[INFO] Parent SHA used: $MAIN_SHA (from Azure 'main')"
+
               PAYLOAD='[{"name": "refs/heads/'"$AZURE_BRANCH"'", "oldObjectId": "0000000000000000000000000000000000000000", "newObjectId": "'$MAIN_SHA'"}]'
+
               RESPONSE=$(curl -s -u ":$AZURE_PAT" -w "%{http_code}" -o /tmp/curl_output "$REFS_API" -H "Content-Type: application/json" -d "$PAYLOAD")
+
               if [[ "$RESPONSE" -ne 200 && "$RESPONSE" -ne 201 ]]; then
                 OUTPUT=$(cat /tmp/curl_output)
                 echo "::error::Failed to create branch ${AZURE_BRANCH} in Azure DevOps (main branch case). Error: $OUTPUT"
                 exit 1
               fi
+
               echo "::notice::✅ Branch '${AZURE_BRANCH}' created in Azure DevOps from parent branch 'main'."
+              echo "sync_success=true" >> $GITHUB_OUTPUT
 
             # 3. Other branches: must have <customer-x>/<parent> as parent in Azure
             else
               if [[ -z "$PARENT_BRANCH" ]]; then
-                echo "::error::Parent branch could not be detected (for example, not a pull request or missing 'base_ref'). Aborting."
+                echo "::error::Parent branch could not be detected. Aborting."
                 exit 1
               fi
+
               AZURE_PARENT_BRANCH="${REPO_NAME}/${PARENT_BRANCH}"
               echo "::notice::[INFO] Parent expected: ${AZURE_PARENT_BRANCH}"
+
               AZURE_PARENT_SHA=$(curl -s -u ":$AZURE_PAT" "$REFS_API&filter=heads/$AZURE_PARENT_BRANCH" \
                 | jq -r '.value[] | select(.name=="refs/heads/'"$AZURE_PARENT_BRANCH"'") | .objectId')
 
@@ -235,14 +291,19 @@ jobs:
               fi
 
               echo "::notice::[INFO] Parent SHA used: $AZURE_PARENT_SHA (from branch '${AZURE_PARENT_BRANCH}')"
+
               PAYLOAD='[{"name": "refs/heads/'"$AZURE_BRANCH"'", "oldObjectId": "0000000000000000000000000000000000000000", "newObjectId": "'$AZURE_PARENT_SHA'"}]'
+
               RESPONSE=$(curl -s -u ":$AZURE_PAT" -w "%{http_code}" -o /tmp/curl_output "$REFS_API" -H "Content-Type: application/json" -d "$PAYLOAD")
+
               if [[ "$RESPONSE" -ne 200 && "$RESPONSE" -ne 201 ]]; then
                 OUTPUT=$(cat /tmp/curl_output)
                 echo "::error::Failed to create branch ${AZURE_BRANCH} in Azure DevOps (feature branch case). Error: $OUTPUT"
                 exit 1
               fi
+
               echo "::notice::✅ Branch '${AZURE_BRANCH}' created in Azure DevOps from parent '${AZURE_PARENT_BRANCH}'."
+              echo "sync_success=true" >> $GITHUB_OUTPUT
             fi
 
           elif [[ "$EVENT" == "delete" ]]; then
@@ -269,4 +330,46 @@ jobs:
             fi
 
             echo "::notice::✅ Branch '${AZURE_BRANCH}' deleted in Azure DevOps."
+          fi
+
+
+      - name: Tag GitHub branch as Azure-mirrored
+        if: steps.azure_sync.outputs.sync_success == 'true' && steps.prep.outputs.event == 'create'
+        run: |
+          BRANCH_NAME="${{ steps.prep.outputs.branch_name }}"
+          TAG_NAME="azure-mirror/${BRANCH_NAME}"
+          
+          echo "Creating Azure mirror tag: $TAG_NAME"
+          
+          # Configure git for tagging
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Create tag pointing to current HEAD
+          git tag "$TAG_NAME" HEAD
+          
+          # Push the tag to origin
+          git push origin "$TAG_NAME"
+          
+          echo "::notice::✅ Tagged branch '$BRANCH_NAME' with Azure mirror tag '$TAG_NAME'"
+
+      - name: Remove Azure mirror tag on branch deletion
+        if: steps.prep.outputs.event == 'delete'
+        run: |
+          BRANCH_NAME="${{ steps.prep.outputs.branch_name }}"
+          TAG_NAME="azure-mirror/${BRANCH_NAME}"
+          
+          echo "Removing Azure mirror tag: $TAG_NAME"
+          
+          # Configure git for tag operations
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Check if tag exists and remove it
+          if git tag -l "$TAG_NAME" | grep -q "^$TAG_NAME$"; then
+            git tag -d "$TAG_NAME" 2>/dev/null || true
+            git push origin ":refs/tags/$TAG_NAME" 2>/dev/null || true
+            echo "::notice::✅ Removed Azure mirror tag '$TAG_NAME'"
+          else
+            echo "::notice::Tag '$TAG_NAME' does not exist, nothing to remove"
           fi
