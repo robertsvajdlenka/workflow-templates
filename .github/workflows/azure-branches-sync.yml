@@ -242,6 +242,7 @@ jobs:
           EVENT="${{ steps.prep.outputs.event }}"
           AZURE_BRANCH="${REPO_NAME}/${BRANCH_NAME}"
           PARENT_BRANCH="${{ steps.parent.outputs.parent_branch }}"
+          AZURE_TAG_NAME="${REPO_NAME}.${BRANCH_NAME}"
 
           REFS_API="https://dev.azure.com/$AZURE_ORG/$AZURE_PROJECT/_apis/git/repositories/$AZURE_REPO/refs?api-version=7.1"
 
@@ -252,83 +253,78 @@ jobs:
           echo "Event type : $EVENT"
           echo "Azure branch : $AZURE_BRANCH"
           echo "Detected parent : $PARENT_BRANCH"
+          echo "Azure tag name : $AZURE_TAG_NAME"
           echo "==============================================================="
 
-          # Set output for tagging step
           echo "sync_success=false" >> $GITHUB_OUTPUT
 
           if [[ "$EVENT" == "create" ]]; then
-            # 1. Check if branch already exists
+            # Ensure the Azure branch does not already exist
             EXISTS=$(curl -s -u ":$AZURE_PAT" "$REFS_API&filter=heads/$AZURE_BRANCH" \
               | jq -r '.value | map(select(.name=="refs/heads/'"$AZURE_BRANCH"'")) | length')
-
             if [[ "$EXISTS" -gt "0" ]]; then
               echo "::error::Branch ${AZURE_BRANCH} already exists in Azure DevOps. Branch creation aborted."
               exit 1
             fi
 
-            # 2. Main branch creation: must originate from Azure 'main'
+            # Resolve the parent commit SHA to base the new branch on
             if [[ "$BRANCH_NAME" == "main" ]]; then
-              echo "::notice::[INFO] Creating the first customer main branch, e.g. 'customer-x/main'."
-
-              MAIN_SHA=$(curl -s -u ":$AZURE_PAT" "$REFS_API&filter=heads/main" | jq -r '.value[] | select(.name=="refs/heads/main") | .objectId')
-
-              if [[ -z "$MAIN_SHA" || "$MAIN_SHA" == "null" ]]; then
-                echo "::error::'main' branch does not exist in Azure DevOps repo. Cannot create initial branch (e.g. 'customer-x/main')."
+              PARENT_SHA=$(curl -s -u ":$AZURE_PAT" "$REFS_API&filter=heads/main" \
+                | jq -r '.value[] | select(.name=="refs/heads/main") | .objectId')
+              if [[ -z "$PARENT_SHA" || "$PARENT_SHA" == "null" ]]; then
+                echo "::error::'main' branch does not exist in Azure DevOps repo. Cannot create initial branch."
                 exit 1
               fi
-
-              echo "::notice::[INFO] Parent SHA used: $MAIN_SHA (from Azure 'main')"
-
-              PAYLOAD='[{"name": "refs/heads/'"$AZURE_BRANCH"'", "oldObjectId": "0000000000000000000000000000000000000000", "newObjectId": "'$MAIN_SHA'"}]'
-
-              RESPONSE=$(curl -s -u ":$AZURE_PAT" -w "%{http_code}" -o /tmp/curl_output "$REFS_API" -H "Content-Type: application/json" -d "$PAYLOAD")
-
-              if [[ "$RESPONSE" -ne 200 && "$RESPONSE" -ne 201 ]]; then
-                OUTPUT=$(cat /tmp/curl_output)
-                echo "::error::Failed to create branch ${AZURE_BRANCH} in Azure DevOps (main branch case). Error: $OUTPUT"
-                exit 1
-              fi
-
-              echo "::notice::✅ Branch '${AZURE_BRANCH}' created in Azure DevOps from parent branch 'main'."
-              echo "sync_success=true" >> $GITHUB_OUTPUT
-
-            # 3. Other branches: must have <customer-x>/<parent> as parent in Azure
+              echo "::notice::[INFO] Parent SHA used: $PARENT_SHA (from Azure 'main')"
             else
               if [[ -z "$PARENT_BRANCH" ]]; then
                 echo "::error::Parent branch could not be detected. Aborting."
                 exit 1
               fi
-
               AZURE_PARENT_BRANCH="${REPO_NAME}/${PARENT_BRANCH}"
-              echo "::notice::[INFO] Parent expected: ${AZURE_PARENT_BRANCH}"
-
-              AZURE_PARENT_SHA=$(curl -s -u ":$AZURE_PAT" "$REFS_API&filter=heads/$AZURE_PARENT_BRANCH" \
+              PARENT_SHA=$(curl -s -u ":$AZURE_PAT" "$REFS_API&filter=heads/$AZURE_PARENT_BRANCH" \
                 | jq -r '.value[] | select(.name=="refs/heads/'"$AZURE_PARENT_BRANCH"'") | .objectId')
-
-              if [[ -z "$AZURE_PARENT_SHA" || "$AZURE_PARENT_SHA" == "null" ]]; then
+              if [[ -z "$PARENT_SHA" || "$PARENT_SHA" == "null" ]]; then
                 echo "::error::Parent branch '${AZURE_PARENT_BRANCH}' does not exist in Azure DevOps repo. Branch creation aborted."
                 exit 1
               fi
-
-              echo "::notice::[INFO] Parent SHA used: $AZURE_PARENT_SHA (from branch '${AZURE_PARENT_BRANCH}')"
-
-              PAYLOAD='[{"name": "refs/heads/'"$AZURE_BRANCH"'", "oldObjectId": "0000000000000000000000000000000000000000", "newObjectId": "'$AZURE_PARENT_SHA'"}]'
-
-              RESPONSE=$(curl -s -u ":$AZURE_PAT" -w "%{http_code}" -o /tmp/curl_output "$REFS_API" -H "Content-Type: application/json" -d "$PAYLOAD")
-
-              if [[ "$RESPONSE" -ne 200 && "$RESPONSE" -ne 201 ]]; then
-                OUTPUT=$(cat /tmp/curl_output)
-                echo "::error::Failed to create branch ${AZURE_BRANCH} in Azure DevOps (feature branch case). Error: $OUTPUT"
-                exit 1
-              fi
-
-              echo "::notice::✅ Branch '${AZURE_BRANCH}' created in Azure DevOps from parent '${AZURE_PARENT_BRANCH}'."
-              echo "sync_success=true" >> $GITHUB_OUTPUT
+              echo "::notice::[INFO] Parent SHA used: $PARENT_SHA (from branch '${AZURE_PARENT_BRANCH}')"
             fi
 
+            # Tag the parent commit BEFORE creating the branch (single GET + single POST)
+            # - GET current tag objectId (if any)
+            EXISTING_TAG_SHA=$(curl -s -u ":$AZURE_PAT" "$REFS_API&filter=tags/$AZURE_TAG_NAME" \
+              | jq -r '.value[] | select(.name=="refs/tags/'"$AZURE_TAG_NAME"'") | .objectId')
+            # - Choose oldObjectId: zeros for create, existing objectId for update
+            if [[ -z "$EXISTING_TAG_SHA" || "$EXISTING_TAG_SHA" == "null" ]]; then
+              OLD_OBJ="0000000000000000000000000000000000000000"
+            else
+              OLD_OBJ="$EXISTING_TAG_SHA"
+            fi
+            # - Create or move the tag to PARENT_SHA in one POST
+            TAG_PAYLOAD='[{"name": "refs/tags/'"$AZURE_TAG_NAME"'", "oldObjectId": "'$OLD_OBJ'", "newObjectId": "'$PARENT_SHA'"}]'
+            TAG_CODE=$(curl -s -u ":$AZURE_PAT" -w "%{http_code}" -o /tmp/tag_output "$REFS_API" -H "Content-Type: application/json" -d "$TAG_PAYLOAD")
+            if [[ "$TAG_CODE" -ne 200 && "$TAG_CODE" -ne 201 ]]; then
+              ERR=$(cat /tmp/tag_output)
+              echo "::error::Failed to set tag '${AZURE_TAG_NAME}' to ${PARENT_SHA}. Error: $ERR"
+              exit 1
+            fi
+            echo "::notice::✅ CI tag '${AZURE_TAG_NAME}' now points to ${PARENT_SHA}."
+
+            # Create the Azure branch from the resolved parent commit
+            PAYLOAD='[{"name": "refs/heads/'"$AZURE_BRANCH"'", "oldObjectId": "0000000000000000000000000000000000000000", "newObjectId": "'$PARENT_SHA'"}]'
+            RESPONSE=$(curl -s -u ":$AZURE_PAT" -w "%{http_code}" -o /tmp/curl_output "$REFS_API" -H "Content-Type: application/json" -d "$PAYLOAD")
+            if [[ "$RESPONSE" -ne 200 && "$RESPONSE" -ne 201 ]]; then
+              OUTPUT=$(cat /tmp/curl_output)
+              echo "::error::Failed to create branch ${AZURE_BRANCH} in Azure DevOps. Error: $OUTPUT"
+              exit 1
+            fi
+            echo "::notice::✅ Branch '${AZURE_BRANCH}' created in Azure DevOps."
+
+            echo "sync_success=true" >> $GITHUB_OUTPUT
+
           elif [[ "$EVENT" == "delete" ]]; then
-            # For branch deletion, always try to delete
+            # Delete the Azure branch
             echo "::notice::[INFO] Deleting branch ${AZURE_BRANCH} from Azure Repos."
             RESULT=$(curl -s -u ":$AZURE_PAT" "$REFS_API&filter=heads/$AZURE_BRANCH")
             BRANCH_SHA=$(echo "$RESULT" | jq -r '.value[] | select(.name=="refs/heads/'"$AZURE_BRANCH"'") | .objectId')
@@ -336,6 +332,7 @@ jobs:
               echo "::warning::Branch ${AZURE_BRANCH} does not exist in Azure DevOps. Skipping deletion."
               exit 0
             fi
+
             PAYLOAD='[{"name": "refs/heads/'"$AZURE_BRANCH"'", "oldObjectId": "'$BRANCH_SHA'", "newObjectId": "0000000000000000000000000000000000000000"}]'
             RESPONSE=$(curl -s -u ":$AZURE_PAT" -w "%{http_code}" -o /tmp/curl_output -X POST "$REFS_API" -H "Content-Type: application/json" -d "$PAYLOAD")
             if [[ "$RESPONSE" -ne 200 && "$RESPONSE" -ne 201 ]]; then
@@ -344,15 +341,23 @@ jobs:
               exit 1
             fi
 
-            CHECK=$(curl -s -u ":$AZURE_PAT" "$REFS_API&filter=heads/$AZURE_BRANCH" | jq -r '.value | map(select(.name=="refs/heads/'"$AZURE_BRANCH"'")) | length')
+            CHECK=$(curl -s -u ":$AZURE_PAT" "$REFS_API&filter=heads/$AZURE_BRANCH" \
+              | jq -r '.value | map(select(.name=="refs/heads/'"$AZURE_BRANCH"'")) | length')
             if [[ "$CHECK" -gt "0" ]]; then
               echo "::error::Branch ${AZURE_BRANCH} still exists after deletion attempt. Most likely permission denied!"
               exit 1
             fi
-
             echo "::notice::✅ Branch '${AZURE_BRANCH}' deleted in Azure DevOps."
-          fi
 
+            # Delete the CI tag if present
+            TAG_RESULT=$(curl -s -u ":$AZURE_PAT" "$REFS_API&filter=tags/$AZURE_TAG_NAME")
+            TAG_SHA=$(echo "$TAG_RESULT" | jq -r '.value[] | select(.name=="refs/tags/'"$AZURE_TAG_NAME"'") | .objectId')
+            if [[ -z "$TAG_SHA" || "$TAG_SHA" == "null" ]]; then
+              echo "::notice::Tag '${AZURE_TAG_NAME}' does not exist in Azure DevOps, nothing to remove."
+            else
+              TAG_DELETE_PAYLOAD='[{"name": "refs/tags/'"$AZURE_TAG_NAME"'", "oldObjectId": "'$TAG_SHA'", "newObjectId": "0000000000000000000000000000000000000000"}]'
+              TAG_DELETE_RESPONSE=$(curl -s -u ":$AZURE_PAT" -w "%{http_code}" -o /tmp/tag_del_output -X POST "$REFS_API
+          
 
       - name: Tag GitHub branch as Azure-mirrored
         if: steps.azure_sync.outputs.sync_success == 'true' && steps.prep.outputs.event == 'create'
