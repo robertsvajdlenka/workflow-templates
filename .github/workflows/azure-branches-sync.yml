@@ -372,9 +372,13 @@ jobs:
         run: |
           BRANCH_NAME="${{ steps.prep.outputs.branch_name }}"
           TAG_NAME="azure-mirror/${BRANCH_NAME}"
-          
-          echo "Creating Azure mirror tag: $TAG_NAME"
-          
+      
+          git fetch --tags --quiet      
+          if git rev-parse -q --verify "refs/tags/$TAG_NAME" >/dev/null; then
+            exit 0
+          fi
+      
+          echo "Creating Azure mirror tag: $TAG_NAME"      
           # Configure git for tagging
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -383,7 +387,7 @@ jobs:
           git tag "$TAG_NAME" HEAD
           
           # Push the tag to origin
-          git push origin "$TAG_NAME"
+          git push origin "refs/tags/$TAG_NAME"
           
           echo "::notice::✅ Tagged branch '$BRANCH_NAME' with Azure mirror tag '$TAG_NAME'"
 
