@@ -356,7 +356,15 @@ jobs:
               echo "::notice::Tag '${AZURE_TAG_NAME}' does not exist in Azure DevOps, nothing to remove."
             else
               TAG_DELETE_PAYLOAD='[{"name": "refs/tags/'"$AZURE_TAG_NAME"'", "oldObjectId": "'$TAG_SHA'", "newObjectId": "0000000000000000000000000000000000000000"}]'
-              TAG_DELETE_RESPONSE=$(curl -s -u ":$AZURE_PAT" -w "%{http_code}" -o /tmp/tag_del_output -X POST "$REFS_API
+              TAG_DELETE_RESPONSE=$(curl -s -u ":$AZURE_PAT" -w "%{http_code}" -o /tmp/tag_del_output -X POST "$REFS_API" -H "Content-Type: application/json" -d "$TAG_DELETE_PAYLOAD")
+              if [[ "$TAG_DELETE_RESPONSE" -ne 200 && "$TAG_DELETE_RESPONSE" -ne 201 ]]; then
+                TAG_DEL_OUT=$(cat /tmp/tag_del_output)
+                echo "::error::Failed to delete tag '${AZURE_TAG_NAME}' in Azure DevOps. Error: $TAG_DEL_OUT"
+                exit 1
+              fi
+              echo "::notice::✅ CI tag '${AZURE_TAG_NAME}' deleted in Azure DevOps."
+            fi
+          fi
           
 
       - name: Tag GitHub branch as Azure-mirrored
