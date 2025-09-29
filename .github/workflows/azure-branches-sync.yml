@@ -242,7 +242,7 @@ jobs:
           EVENT="${{ steps.prep.outputs.event }}"
           AZURE_BRANCH="${REPO_NAME}/${BRANCH_NAME}"
           PARENT_BRANCH="${{ steps.parent.outputs.parent_branch }}"
-          AZURE_TAG_NAME="${REPO_NAME}.${BRANCH_NAME}"
+          AZURE_TAG_NAME="${REPO_NAME}__${BRANCH_NAME}"
 
           REFS_API="https://dev.azure.com/$AZURE_ORG/$AZURE_PROJECT/_apis/git/repositories/$AZURE_REPO/refs?api-version=7.1"
 
