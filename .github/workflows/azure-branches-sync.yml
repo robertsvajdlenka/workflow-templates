@@ -291,25 +291,29 @@ jobs:
               echo "::notice::[INFO] Parent SHA used: $PARENT_SHA (from branch '${AZURE_PARENT_BRANCH}')"
             fi
 
-            # Tag the parent commit BEFORE creating the branch (single GET + single POST)
-            # - GET current tag objectId (if any)
-            EXISTING_TAG_SHA=$(curl -s -u ":$AZURE_PAT" "$REFS_API&filter=tags/$AZURE_TAG_NAME" \
-              | jq -r '.value[] | select(.name=="refs/tags/'"$AZURE_TAG_NAME"'") | .objectId')
-            # - Choose oldObjectId: zeros for create, existing objectId for update
-            if [[ -z "$EXISTING_TAG_SHA" || "$EXISTING_TAG_SHA" == "null" ]]; then
-              OLD_OBJ="0000000000000000000000000000000000000000"
+            # Tag the parent commit BEFORE creating the branch (only for automatic triggers, not manual)
+            if [[ "${GITHUB_EVENT_NAME}" != "workflow_dispatch" ]]; then
+              # - GET current tag objectId (if any)
+              EXISTING_TAG_SHA=$(curl -s -u ":$AZURE_PAT" "$REFS_API&filter=tags/$AZURE_TAG_NAME" \
+                | jq -r '.value[] | select(.name=="refs/tags/'"$AZURE_TAG_NAME"'") | .objectId')
+              # - Choose oldObjectId: zeros for create, existing objectId for update
+              if [[ -z "$EXISTING_TAG_SHA" || "$EXISTING_TAG_SHA" == "null" ]]; then
+                OLD_OBJ="0000000000000000000000000000000000000000"
+              else
+                OLD_OBJ="$EXISTING_TAG_SHA"
+              fi
+              # - Create or move the tag to PARENT_SHA in one POST
+              TAG_PAYLOAD='[{"name": "refs/tags/'"$AZURE_TAG_NAME"'", "oldObjectId": "'$OLD_OBJ'", "newObjectId": "'$PARENT_SHA'"}]'
+              TAG_CODE=$(curl -s -u ":$AZURE_PAT" -w "%{http_code}" -o /tmp/tag_output "$REFS_API" -H "Content-Type: application/json" -d "$TAG_PAYLOAD")
+              if [[ "$TAG_CODE" -ne 200 && "$TAG_CODE" -ne 201 ]]; then
+                ERR=$(cat /tmp/tag_output)
+                echo "::error::Failed to set tag '${AZURE_TAG_NAME}' to ${PARENT_SHA}. Error: $ERR"
+                exit 1
+              fi
+              echo "::notice::✅ CI tag '${AZURE_TAG_NAME}' now points to ${PARENT_SHA}."
             else
-              OLD_OBJ="$EXISTING_TAG_SHA"
+              echo "::notice::⏩ Skipping Azure tag creation (manual workflow_dispatch trigger)"
             fi
-            # - Create or move the tag to PARENT_SHA in one POST
-            TAG_PAYLOAD='[{"name": "refs/tags/'"$AZURE_TAG_NAME"'", "oldObjectId": "'$OLD_OBJ'", "newObjectId": "'$PARENT_SHA'"}]'
-            TAG_CODE=$(curl -s -u ":$AZURE_PAT" -w "%{http_code}" -o /tmp/tag_output "$REFS_API" -H "Content-Type: application/json" -d "$TAG_PAYLOAD")
-            if [[ "$TAG_CODE" -ne 200 && "$TAG_CODE" -ne 201 ]]; then
-              ERR=$(cat /tmp/tag_output)
-              echo "::error::Failed to set tag '${AZURE_TAG_NAME}' to ${PARENT_SHA}. Error: $ERR"
-              exit 1
-            fi
-            echo "::notice::✅ CI tag '${AZURE_TAG_NAME}' now points to ${PARENT_SHA}."
 
             # Create the Azure branch from the resolved parent commit
             PAYLOAD='[{"name": "refs/heads/'"$AZURE_BRANCH"'", "oldObjectId": "0000000000000000000000000000000000000000", "newObjectId": "'$PARENT_SHA'"}]'
