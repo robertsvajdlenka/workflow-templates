@@ -9,6 +9,11 @@ on:
       azure_project:
         required: true
         type: string
+      base_branch:
+        description: "GitHub branch treated as the root branch (default: main)"
+        required: false
+        type: string
+        default: main
     secrets:
       AZURE_PAT:
         required: true
@@ -20,6 +25,8 @@ jobs:
       AZURE_ORG: ${{ inputs.azure_org }}
       AZURE_PROJECT: ${{ inputs.azure_project }}
       AZURE_PAT: ${{ secrets.AZURE_PAT }}
+      # GitHub root branch; falls back to 'main' when the input is missing or empty
+      BASE_BRANCH: ${{ inputs.base_branch || 'main' }}
 
     steps:
       - name: Checkout repository
@@ -43,13 +50,15 @@ jobs:
           REPO_NAME="${GITHUB_REPOSITORY##*/}"
           echo "repo_name=$REPO_NAME" >> $GITHUB_OUTPUT
 
+          echo "Base branch: $BASE_BRANCH"
+
           # Detect GitHub event type
           EVENT="${GITHUB_EVENT_NAME}"
           if [ "$EVENT" = "workflow_dispatch" ]; then
-            # Manual run - only allowed for 'main' branch!
+            # Manual run - only allowed for the base branch!
             BRANCH_NAME="${GITHUB_REF#refs/heads/}"
-            if [ "$BRANCH_NAME" != "main" ]; then
-              echo "::error::Manual run ('workflow_dispatch') allowed only for 'main', not for '$BRANCH_NAME'."
+            if [ "$BRANCH_NAME" != "$BASE_BRANCH" ]; then
+              echo "::error::Manual run ('workflow_dispatch') allowed only for '$BASE_BRANCH', not for '$BRANCH_NAME'."
               exit 1
             fi
             EVENT="create"
@@ -82,11 +91,12 @@ jobs:
       
           echo "---- DEBUG ----"
           echo "BRANCH_NAME: $BRANCH_NAME"
+          echo "BASE_BRANCH: $BASE_BRANCH"
           echo "EVENT: $EVENT"
       
-          # If the branch is 'main', we do not need to detect the parent
-          if [[ "$BRANCH_NAME" == "main" ]]; then
-            echo "::notice::Branch is 'main', skipping parent branch detection."
+          # If the branch is the base branch, we do not need to detect the parent
+          if [[ "$BRANCH_NAME" == "$BASE_BRANCH" ]]; then
+            echo "::notice::Branch is '$BASE_BRANCH' (base), skipping parent branch detection."
             echo "parent_branch=" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -132,12 +142,12 @@ jobs:
               echo "::warning::No branches found with Azure mirror tags."
               echo "This might be the first branch being synced, or tags are missing."
               
-              # Fallback to 'main' if it exists (for the very first sync)
-              if git rev-parse --verify "origin/main" >/dev/null 2>&1; then
-                PARENT_BRANCH="main"
-                echo "::notice::Using 'main' as fallback parent (no tagged branches found)"
+              # Fallback to the base branch if it exists (for the very first sync)
+              if git rev-parse --verify "origin/$BASE_BRANCH" >/dev/null 2>&1; then
+                PARENT_BRANCH="$BASE_BRANCH"
+                echo "::notice::Using '$BASE_BRANCH' as fallback parent (no tagged branches found)"
               else
-                echo "::error::No tagged branches found and 'main' doesn't exist. Cannot determine parent."
+                echo "::error::No tagged branches found and '$BASE_BRANCH' doesn't exist. Cannot determine parent."
                 exit 1
               fi
             else
@@ -164,16 +174,16 @@ jobs:
       
               # PRIORITY 1: Prefer branches with same SHA (exact match)
               if [[ ${#SAME_SHA_PARENTS[@]} -gt 0 ]]; then
-                # If main is among same SHA branches, prefer it
+                # If the base branch is among same SHA branches, prefer it
                 for candidate in "${SAME_SHA_PARENTS[@]}"; do
-                  if [[ "$candidate" == "main" ]]; then
-                    PARENT_BRANCH="main"
-                    echo "::notice::Selected 'main' as parent branch (same SHA, preferred)"
+                  if [[ "$candidate" == "$BASE_BRANCH" ]]; then
+                    PARENT_BRANCH="$BASE_BRANCH"
+                    echo "::notice::Selected '$BASE_BRANCH' as parent branch (same SHA, preferred)"
                     break
                   fi
                 done
                 
-                # If main is not among same SHA branches, use the first one
+                # If the base branch is not among same SHA branches, use the first one
                 if [[ -z "$PARENT_BRANCH" ]]; then
                   PARENT_BRANCH="${SAME_SHA_PARENTS[0]}"
                   echo "::notice::Selected parent branch from same SHA match: $PARENT_BRANCH"
@@ -181,16 +191,16 @@ jobs:
                 
               # PRIORITY 2: Fall back to ancestor branches
               elif [[ ${#ANCESTOR_PARENTS[@]} -gt 0 ]]; then
-                # Prefer 'main' if it's in the ancestor list
+                # Prefer the base branch if it's in the ancestor list
                 for candidate in "${ANCESTOR_PARENTS[@]}"; do
-                  if [[ "$candidate" == "main" ]]; then
-                    PARENT_BRANCH="main"
-                    echo "::notice::Selected 'main' as parent branch (ancestor, preferred)"
+                  if [[ "$candidate" == "$BASE_BRANCH" ]]; then
+                    PARENT_BRANCH="$BASE_BRANCH"
+                    echo "::notice::Selected '$BASE_BRANCH' as parent branch (ancestor, preferred)"
                     break
                   fi
                 done
       
-                # If main is not in the ancestor list, use the first available
+                # If the base branch is not in the ancestor list, use the first available
                 if [[ -z "$PARENT_BRANCH" ]]; then
                   PARENT_BRANCH="${ANCESTOR_PARENTS[0]}"
                   echo "::notice::Selected first available ancestor as parent: $PARENT_BRANCH"
@@ -218,7 +228,7 @@ jobs:
       
           # Log the final result or fail if parent could not be detected
           if [[ -z "$PARENT_BRANCH" ]]; then
-            echo "::error::Parent branch could not be detected for branch '$BRANCH_NAME' (not main). Aborting."
+            echo "::error::Parent branch could not be detected for branch '$BRANCH_NAME' (not '$BASE_BRANCH'). Aborting."
             exit 1
           else
             echo "::notice::Final detected PARENT_BRANCH: $PARENT_BRANCH"
@@ -249,6 +259,7 @@ jobs:
           echo "Azure Repo name : $AZURE_REPO"
           echo "Github Repo name : $REPO_NAME"
           echo "Github Branch name : $BRANCH_NAME"
+          echo "Github Base branch : $BASE_BRANCH"
           echo "Event type : $EVENT"
           echo "Azure branch : $AZURE_BRANCH"
           echo "Detected parent : $PARENT_BRANCH"
@@ -266,7 +277,8 @@ jobs:
             fi
 
             # Resolve the parent commit SHA to base the new branch on
-            if [[ "$BRANCH_NAME" == "main" ]]; then
+            if [[ "$BRANCH_NAME" == "$BASE_BRANCH" ]]; then
+              # The GitHub base branch is always created from the Azure repo's own 'main'
               PARENT_SHA=$(curl -s -u ":$AZURE_PAT" "$REFS_API&filter=heads/main" \
                 | jq -r '.value[] | select(.name=="refs/heads/main") | .objectId')
               if [[ -z "$PARENT_SHA" || "$PARENT_SHA" == "null" ]]; then
